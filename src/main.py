@@ -18,7 +18,6 @@ CACHE_DIR = Path("../cache")
 OUTPUT_DIR = Path("../output")
 START_URL = "https://books.toscrape.com/catalogue/page-1.html"
 
-# Pydantic Schema for a Book Record
 class BookRecord(BaseModel):
     title: str
     product_url: HttpUrl
@@ -30,34 +29,42 @@ class BookRecord(BaseModel):
     source_page: HttpUrl
     fetched_at: str
 
-def fetch_and_cache_page(url, cache_filename):
-    """Fetches a page politely or loads it from cache if it exists."""
+def fetch_and_cache_page(url, cache_filename, run_stats):
+    """Fetches a page politely with retries, or loads it from cache if it exists."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = CACHE_DIR / cache_filename
 
     if cache_path.exists():
+        run_stats["cache_hits"] += 1
         with open(cache_path, "r", encoding="utf-8") as f:
             return f.read()
 
     print(f"FETCH: {url}")
+    run_stats["pages_fetched"] += 1
     headers = {"User-Agent": USER_AGENT}
-    try:
-        response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
-        if response.status_code != 200:
-            print(f"Failed to fetch {url} - Status Code: {response.status_code}")
-            return None
-        html_content = response.text
-        
-        with open(cache_path, "w", encoding="utf-8") as f:
-            f.write(html_content)
-        time.sleep(DELAY_SECONDS)
-        return html_content
-    except requests.RequestException as e:
-        print(f"Request failed: {e}")
-        return None
+    
+    for attempt in range(2): # Max 2 attempts (1 initial + 1 retry)
+        try:
+            response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
+            if response.status_code == 200:
+                html_content = response.text
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    f.write(html_content)
+                time.sleep(DELAY_SECONDS)
+                return html_content
+            elif response.status_code in (403, 404):
+                print(f"Failed to fetch {url} - Status Code: {response.status_code}. Not retrying.")
+                return None
+            else:
+                print(f"Server error {response.status_code} for {url}. Retrying...")
+                time.sleep(1) # Wait a moment before retrying
+        except requests.RequestException as e:
+            print(f"Request exception for {url}: {e}. Retrying...")
+            time.sleep(1)
+            
+    return None
 
 def extract_book_details(html, product_url, source_page):
-    """Extracts the fields from a book's detail page."""
     soup = BeautifulSoup(html, "html.parser")
     
     title_element = soup.select_one(".product_main h1")
@@ -66,7 +73,6 @@ def extract_book_details(html, product_url, source_page):
     price_element = soup.select_one(".product_main .price_color")
     price_text = price_element.text if price_element else None
     
-    # Extract the numeric price from the text (e.g., "£51.77" -> 51.77)
     price_gbp = None
     if price_text:
         match = re.search(r"[\d.]+", price_text)
@@ -101,6 +107,17 @@ def extract_book_details(html, product_url, source_page):
     }
 
 def main():
+    start_time = datetime.now(timezone.utc)
+    run_stats = {
+        "start_time": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "duration_seconds": 0,
+        "pages_fetched": 0,
+        "cache_hits": 0,
+        "valid_records": 0,
+        "invalid_records": 0,
+        "failed_pages": 0
+    }
+
     catalogue_pages_visited = 0
     discovered_urls = {}
     current_url = START_URL
@@ -108,7 +125,7 @@ def main():
     # Stage 2: Discover URLs
     while current_url and catalogue_pages_visited < 3:
         filename = current_url.split("/")[-1]
-        html = fetch_and_cache_page(current_url, filename)
+        html = fetch_and_cache_page(current_url, filename, run_stats)
         if not html:
             break
             
@@ -129,8 +146,10 @@ def main():
         else:
             current_url = None
 
-    # Stage 3: Extract and Stage 4: Validate
-    valid_records = {} # Dict for idempotency (key: product_url)
+    # Fake URL deliberately injected to test failure handling (Stage 5)
+    discovered_urls["https://books.toscrape.com/catalogue/made-up-book-that-does-not-exist_9999/index.html"] = START_URL
+
+    valid_records = {} 
     errors = []
     
     for book_url, source_catalogue_url in discovered_urls.items():
@@ -138,45 +157,48 @@ def main():
         book_id = parts[-2] if len(parts) > 1 else parts[-1]
         filename = f"book-{book_id}.html"
         
-        book_html = fetch_and_cache_page(book_url, filename)
-        if book_html:
-            raw_record = extract_book_details(book_html, book_url, source_catalogue_url)
-            
-            # Stage 4: Validate against Pydantic schema
-            try:
-                validated_record = BookRecord(**raw_record)
-                # Store using product_url as canonical ID for idempotency
-                valid_records[str(validated_record.product_url)] = validated_record.model_dump(mode="json")
-            except ValidationError as e:
-                # Store the failing record and the reason
-                errors.append({
-                    "record": raw_record,
-                    "reason": e.errors()
-                })
+        book_html = fetch_and_cache_page(book_url, filename, run_stats)
+        
+        if not book_html:
+            run_stats["failed_pages"] += 1
+            print(f"Skipping failed page: {book_url}")
+            continue
 
-    # Stage 4: Output to JSON files
+        raw_record = extract_book_details(book_html, book_url, source_catalogue_url)
+        
+        try:
+            validated_record = BookRecord(**raw_record)
+            valid_records[str(validated_record.product_url)] = validated_record.model_dump(mode="json")
+            run_stats["valid_records"] += 1
+        except ValidationError as e:
+            errors.append({
+                "record": raw_record,
+                "reason": e.errors()
+            })
+            run_stats["invalid_records"] += 1
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
-    books_file = OUTPUT_DIR / "books.json"
-    with open(books_file, "w", encoding="utf-8") as f:
+    with open(OUTPUT_DIR / "books.json", "w", encoding="utf-8") as f:
         json.dump(list(valid_records.values()), f, indent=2)
         
-    errors_file = OUTPUT_DIR / "errors.json"
-    with open(errors_file, "w", encoding="utf-8") as f:
+    with open(OUTPUT_DIR / "errors.json", "w", encoding="utf-8") as f:
         json.dump(errors, f, indent=2)
 
-    # Checkpoint output
-    with open(books_file, "r", encoding="utf-8") as f:
-        saved_books = json.load(f)
-        
-    print(f"books.json has {len(saved_books)} records.")
+    # Finalize run report
+    end_time = datetime.now(timezone.utc)
+    run_stats["duration_seconds"] = round((end_time - start_time).total_seconds(), 2)
     
-    if saved_books:
-        first_book = saved_books[0]
-        price_val = first_book.get("price_gbp")
-        url_val = first_book.get("product_url")
-        print(f"Is price_gbp a number? {isinstance(price_val, (int, float))} (Value: {price_val})")
-        print(f"Does URL start with https://? {url_val.startswith('https://')} (Value: {url_val})")
+    with open(OUTPUT_DIR / "run-report.json", "w", encoding="utf-8") as f:
+        json.dump(run_stats, f, indent=2)
+
+    # Checkpoint output
+    with open(OUTPUT_DIR / "run-report.json", "r", encoding="utf-8") as f:
+        report = json.load(f)
+        
+    print(f"\nrun-report.json shows failed_pages: {report['failed_pages']}")
+    print(f"books.json still has {report['valid_records']} good records.")
+    print(f"Run completed in {report['duration_seconds']} seconds.")
 
 if __name__ == "__main__":
     main()
